@@ -63,3 +63,16 @@ The voting application only accepts one vote per client browser. It does not reg
 This isn't an example of a properly architected perfectly designed distributed app... it's just a simple
 example of the various types of pieces and languages you might see (queues, persistent data, etc), and how to
 deal with them in Docker at a basic level.
+
+## AWS Cloud Deployment
+
+This portfolio project deploys the Example Voting App to Amazon Web Services (AWS) using Terraform, Amazon EKS, and GitHub Actions.
+
+- **Target Deployment Region**: **Asia Pacific (Sydney), `ap-southeast-2`**
+- **Local AWS CLI Profile**: `new-account`
+- **Cloud Architecture**:
+  - **VPC & Networking**: Multi-AZ VPC in `ap-southeast-2` spanning two Availability Zones with public and private subnets, one Internet Gateway, and a single cost-conscious NAT Gateway.
+  - **Compute & Orchestration**: Amazon Elastic Kubernetes Service (EKS) managed worker nodes deployed strictly in private subnets with encrypted EBS volumes.
+  - **Container Registry**: Amazon Elastic Container Registry (ECR).
+  - **Infrastructure as Code**: Terraform configurations located in [`terraform/`](./terraform).
+  - **CI/CD Automation**: GitHub Actions authenticated securely via AWS OIDC federation.

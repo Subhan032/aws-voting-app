@@ -1,0 +1,275 @@
+name: Deploy AWS Voting App to Amazon EKS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'vote/**'
+      - 'result/**'
+      - 'worker/**'
+      - 'k8s-specifications/**'
+      - '.github/workflows/deploy.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: eks-cluster-deployment
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-southeast-2
+  EKS_CLUSTER_NAME: aws-voting-app-dev-eks
+  TARGET_NAMESPACE: voting-app
+  ECR_REGISTRY: 740255824462.dkr.ecr.ap-southeast-2.amazonaws.com
+
+jobs:
+  validate:
+    name: Validate Kubernetes Manifests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Ensure PyYAML Dependency
+        run: |
+          python3 -c "import yaml" 2>/dev/null || pip3 install pyyaml
+
+      - name: Validate Manifests (Offline YAML Syntax)
+        run: |
+          python3 - << 'EOF'
+          import glob
+          import sys
+          import yaml
+
+          # Primary manifests expected for the application deployment
+          required_manifests = [
+              "k8s-specifications/db-deployment.yaml",
+              "k8s-specifications/db-service.yaml",
+              "k8s-specifications/redis-deployment.yaml",
+              "k8s-specifications/redis-service.yaml",
+              "k8s-specifications/worker-deployment.yaml",
+              "k8s-specifications/vote-deployment.yaml",
+              "k8s-specifications/vote-service.yaml",
+              "k8s-specifications/result-deployment.yaml",
+              "k8s-specifications/result-service.yaml",
+          ]
+
+          # Find all YAML manifests in k8s-specifications/, explicitly excluding template/example files
+          manifests = sorted([
+              f for f in glob.glob("k8s-specifications/*.yaml*")
+              if not f.endswith(".example") and not f.endswith(".example.yaml")
+          ])
+
+          missing = [f for f in required_manifests if f not in manifests]
+          if missing:
+              print(f"Error: Missing expected Kubernetes manifest(s): {missing}")
+              sys.exit(1)
+
+          failed = False
+          print(f"Validating {len(manifests)} Kubernetes manifest(s)...")
+
+          for path in manifests:
+              try:
+                  with open(path, "r", encoding="utf-8") as f:
+                      docs = list(yaml.safe_load_all(f))
+                      if not docs:
+                          print(f"  [FAIL] {path}: Empty file or no YAML documents found")
+                          failed = True
+                          continue
+                      for idx, doc in enumerate(docs):
+                          if doc is None:
+                              continue
+                          if not isinstance(doc, dict):
+                              print(f"  [FAIL] {path} doc #{idx+1}: Root structure is not a mapping/dictionary")
+                              failed = True
+                          elif "apiVersion" not in doc or "kind" not in doc or "metadata" not in doc:
+                              print(f"  [FAIL] {path} doc #{idx+1}: Missing required Kubernetes fields (apiVersion, kind, metadata)")
+                              failed = True
+                  print(f"  [OK] {path}")
+              except Exception as err:
+                  print(f"  [FAIL] {path}: {err}")
+                  failed = True
+
+          if failed:
+              print("Kubernetes manifest validation failed.")
+              sys.exit(1)
+
+          print("All primary Kubernetes manifests passed offline YAML validation successfully.")
+          EOF
+
+  build-and-push:
+    name: Build & Push Workload Images
+    needs: validate
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        workload:
+          - name: vote
+            context: ./vote
+            repository: aws-voting-app-vote
+          - name: result
+            context: ./result
+            repository: aws-voting-app-result
+          - name: worker
+            context: ./worker
+            repository: aws-voting-app-worker
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+      - name: Build and Push Image
+        env:
+          REPOSITORY: ${{ matrix.workload.repository }}
+          CONTEXT_DIR: ${{ matrix.workload.context }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "Building ${REPOSITORY}:${IMAGE_TAG} from ${CONTEXT_DIR}..."
+          docker build -t "${ECR_REGISTRY}/${REPOSITORY}:${IMAGE_TAG}" "${CONTEXT_DIR}"
+          echo "Pushing immutable image ${ECR_REGISTRY}/${REPOSITORY}:${IMAGE_TAG}..."
+          docker push "${ECR_REGISTRY}/${REPOSITORY}:${IMAGE_TAG}"
+
+  deploy:
+    name: Deploy Workloads to Amazon EKS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@5579c002bb4778aa43395ef1df492868a9a1c83f # v4.0.2
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@3e0aec4d80787158d308d7b364cb1b702e7feb7f # v4.0.0
+
+      - name: Temporary JIT Allowlist of Runner IP on EKS Public Endpoint
+        id: allowlist
+        run: |
+          # 1. Retrieve and preserve current public CIDR allowlist
+          ORIGINAL_CIDRS=$(aws eks describe-cluster --name "${EKS_CLUSTER_NAME}" --query "cluster.resourcesVpcConfig.publicAccessCidrs" --output text | tr '\t' ',')
+          echo "ORIGINAL_CIDRS=${ORIGINAL_CIDRS}" >> $GITHUB_ENV
+          echo "Preserved original CIDRs: ${ORIGINAL_CIDRS}"
+
+          # 2. Discover current runner external IP
+          RUNNER_IP=$(curl -s https://checkip.amazonaws.com | tr -d '[:space:]')
+          echo "Current GitHub Actions Runner IP: ${RUNNER_IP}"
+
+          # 3. Append runner /32 IP if not already present
+          if [[ ",${ORIGINAL_CIDRS}," != *",${RUNNER_IP}/32,"* ]]; then
+            NEW_CIDRS="${ORIGINAL_CIDRS},${RUNNER_IP}/32"
+            echo "Adding runner IP to EKS publicAccessCidrs: ${NEW_CIDRS}"
+            aws eks update-cluster-config --name "${EKS_CLUSTER_NAME}" --resources-vpc-config publicAccessCidrs="${NEW_CIDRS}"
+            echo "Waiting for EKS control plane update to become active..."
+            aws eks wait cluster-active --name "${EKS_CLUSTER_NAME}"
+            echo "NEED_CLEANUP=true" >> $GITHUB_ENV
+          else
+            echo "Runner IP already in allowlist."
+            echo "NEED_CLEANUP=false" >> $GITHUB_ENV
+          fi
+
+      - name: Update Kubeconfig
+        run: |
+          aws eks update-kubeconfig --region "${AWS_REGION}" --name "${EKS_CLUSTER_NAME}"
+
+      - name: Apply PostgreSQL Secret to Target Namespace
+        env:
+          PG_USER: ${{ vars.POSTGRES_USER || 'postgres' }}
+          PG_PASS: ${{ secrets.POSTGRES_PASSWORD }}
+          PG_DB: ${{ vars.POSTGRES_DB || 'postgres' }}
+        run: |
+          # In-memory secret construction via stdin avoids disk writes and shell interpolation vulnerabilities
+          kubectl create secret generic postgres-secret \
+            --namespace "${TARGET_NAMESPACE}" \
+            --from-literal=POSTGRES_USER="${PG_USER}" \
+            --from-literal=POSTGRES_PASSWORD="${PG_PASS}" \
+            --from-literal=POSTGRES_DB="${PG_DB}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy Databases (PostgreSQL emptyDir & Redis)
+        run: |
+          echo "Applying database backends to ${TARGET_NAMESPACE}..."
+          kubectl apply --namespace "${TARGET_NAMESPACE}" -f k8s-specifications/db-deployment.yaml -f k8s-specifications/db-service.yaml
+          kubectl apply --namespace "${TARGET_NAMESPACE}" -f k8s-specifications/redis-deployment.yaml -f k8s-specifications/redis-service.yaml
+
+          echo "Waiting for database deployments to roll out..."
+          kubectl rollout status deployment/db --namespace "${TARGET_NAMESPACE}" --timeout=120s
+          kubectl rollout status deployment/redis --namespace "${TARGET_NAMESPACE}" --timeout=120s
+
+      - name: Deploy Worker (ECR Image)
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "Patching worker manifest with immutable ECR image..."
+          sed -i "s|image: dockersamples/examplevotingapp_worker|image: ${ECR_REGISTRY}/aws-voting-app-worker:${IMAGE_TAG}|g" k8s-specifications/worker-deployment.yaml
+
+          echo "Applying worker deployment to ${TARGET_NAMESPACE}..."
+          kubectl apply --namespace "${TARGET_NAMESPACE}" -f k8s-specifications/worker-deployment.yaml
+
+          echo "Waiting for worker deployment to roll out..."
+          kubectl rollout status deployment/worker --namespace "${TARGET_NAMESPACE}" --timeout=90s
+
+      - name: Deploy Frontends (Vote & Result ECR Images)
+        env:
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          echo "Patching frontend manifests with immutable ECR images..."
+          sed -i "s|image: dockersamples/examplevotingapp_vote|image: ${ECR_REGISTRY}/aws-voting-app-vote:${IMAGE_TAG}|g" k8s-specifications/vote-deployment.yaml
+          sed -i "s|image: dockersamples/examplevotingapp_result|image: ${ECR_REGISTRY}/aws-voting-app-result:${IMAGE_TAG}|g" k8s-specifications/result-deployment.yaml
+
+          echo "Applying frontend services and deployments to ${TARGET_NAMESPACE}..."
+          kubectl apply --namespace "${TARGET_NAMESPACE}" -f k8s-specifications/vote-deployment.yaml -f k8s-specifications/vote-service.yaml
+          kubectl apply --namespace "${TARGET_NAMESPACE}" -f k8s-specifications/result-deployment.yaml -f k8s-specifications/result-service.yaml
+
+          echo "Waiting for frontend deployments to roll out..."
+          kubectl rollout status deployment/vote --namespace "${TARGET_NAMESPACE}" --timeout=90s
+          kubectl rollout status deployment/result --namespace "${TARGET_NAMESPACE}" --timeout=90s
+
+      - name: Restore EKS Endpoint Public CIDR Allowlist
+        if: always()
+        run: |
+          if [[ "${NEED_CLEANUP}" == "true" && -n "${RUNNER_IP}" ]]; then
+            echo "Checking current EKS allowlist to safely remove runner IP without overwriting admin changes..."
+            aws eks wait cluster-active --name "${EKS_CLUSTER_NAME}" || true
+            CURRENT_CIDRS=$(aws eks describe-cluster --name "${EKS_CLUSTER_NAME}" --query "cluster.resourcesVpcConfig.publicAccessCidrs" --output text | tr '\t' ',')
+            echo "Current live CIDRs: ${CURRENT_CIDRS}"
+
+            # Filter out only the current runner IP from live CIDRs
+            RESTORED_CIDRS=$(echo "${CURRENT_CIDRS}" | tr ',' '\n' | grep -v "^${RUNNER_IP}/32$" | paste -sd, -)
+
+            # Safety fallback: if resulting list is empty, restore saved original CIDRs
+            if [[ -z "${RESTORED_CIDRS}" ]]; then
+              echo "Filtered CIDR list is empty; falling back to saved original CIDRs: ${ORIGINAL_CIDRS}"
+              RESTORED_CIDRS="${ORIGINAL_CIDRS}"
+            fi
+
+            if [[ "${CURRENT_CIDRS}" != "${RESTORED_CIDRS}" ]]; then
+              echo "Applying restored CIDRs: ${RESTORED_CIDRS}"
+              aws eks update-cluster-config --name "${EKS_CLUSTER_NAME}" --resources-vpc-config publicAccessCidrs="${RESTORED_CIDRS}"
+              aws eks wait cluster-active --name "${EKS_CLUSTER_NAME}" || true
+              echo "EKS public endpoint allowlist successfully restored."
+            else
+              echo "Runner IP was already absent from live CIDRs; no update needed."
+            fi
+          else
+            echo "No allowlist cleanup required."
+          fi
+
+

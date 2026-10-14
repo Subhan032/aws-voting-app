@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  labels:
+    app: db
+  name: postgres-pvc
+spec:
+  accessModes:
+  - ReadWriteOnce
+  storageClassName: ebs-gp3-sc
+  resources:
+    requests:
+      storage: 5Gi
+

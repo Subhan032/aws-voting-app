@@ -17,3 +17,13 @@ spec:
       containers:
       - image: dockersamples/examplevotingapp_worker
         name: worker
+        resources:
+          requests:
+            cpu: 50m
+            memory: 96Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+        # Probes omitted intentionally: worker is a non-networked background queue processor
+        # (.NET console application) that pulls tasks from Redis and writes to PostgreSQL.
+        # Process health and crash recovery are managed natively via container process exit and restartPolicy.

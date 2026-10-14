@@ -13,6 +13,10 @@ node_modules/
 *.key
 secrets/
 credentials
+*-secret.yaml
+*secret*.yaml
+!*-secret.yaml.example
+!*secret*.yaml.example
 
 # Terraform local files
 **/.terraform/*
@@ -20,6 +24,8 @@ credentials
 *.tfstate.*
 *.tfvars
 !*.tfvars.example
+*.tfplan
+tfplan
 crash.log
 crash.*.log
 override.tf
